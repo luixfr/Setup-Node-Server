@@ -1,0 +1,18 @@
+services:
+  droplet:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: droplet-test
+    privileged: true
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      # Live-reload the script without rebuilding the image
+      - ./setup.sh:/root/setup.sh
+    ports:
+      - "8080:80"
+      - "8443:443"
+    tmpfs:
+      - /run
+      - /run/lock
+      - /tmp
