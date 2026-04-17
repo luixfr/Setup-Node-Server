@@ -166,6 +166,16 @@ else
     warn "Could not automatically configure PM2 startup. Run 'pm2 startup' manually as $DEPLOY_USER."
 fi
 
+su - "$DEPLOY_USER" -c "
+    pm2 install pm2-logrotate
+    pm2 set pm2-logrotate:max_size 10M
+    pm2 set pm2-logrotate:retain 7
+    pm2 set pm2-logrotate:compress true
+    pm2 set pm2-logrotate:dateFormat YYYY-MM-DD_HH-mm-ss
+    pm2 set pm2-logrotate:rotateInterval '0 0 * * *'
+"
+info "PM2 log rotation configured (10M max, 7 days, daily at midnight, gzip compressed)."
+
 # ============================================================
 # 11. Application Directory
 # ============================================================
