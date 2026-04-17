@@ -87,10 +87,10 @@ Then on the server:
 # Add your environment variables
 nano /var/www/[YOUR_APP_NAME]/.env
 
-# Update the PM2 config to run Next.js instead of the placeholder
+# Update the PM2 config to run your app instead of the placeholder
 nano ~/ecosystem.config.js
-# Change:  script: "node", args: "server.js"
-# To:      your start script: For example, for Next.js "npx",  args: "next start"
+# Next.js:       script: "npx",      args: "next start"
+# TypeScript:    script: "index.ts", interpreter: "./node_modules/.bin/tsx"
 
 pm2 restart [YOUR_APP_NAME] && pm2 save
 ```

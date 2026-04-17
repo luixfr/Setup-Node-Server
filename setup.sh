@@ -47,11 +47,16 @@ read -rp "Node.js app port [3000]: " APP_PORT
 APP_PORT="${APP_PORT:-3000}"
 
 echo ""
+read -rp "Node.js version [lts]: " NODE_VERSION
+NODE_VERSION="${NODE_VERSION:-lts}"
+
+echo ""
 info "Configuration summary:"
 echo "  Domain:      $DOMAIN"
 echo "  App name:    $APP_NAME"
 echo "  Deploy user: $DEPLOY_USER"
 echo "  App port:    $APP_PORT"
+echo "  Node.js:     $NODE_VERSION"
 echo ""
 read -rp "Proceed with setup? [y/N]: " CONFIRM
 [[ "${CONFIRM,,}" != "y" ]] && error "Aborted by user."
@@ -141,14 +146,23 @@ info "Certbot installed."
 # 9. Runtime Environment — Node.js
 # ============================================================
 
-section "9. Node.js Installation"
+section "9. Node.js Installation (via n)"
 
+# Bootstrap Node.js via nodesource
 curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
-apt install -y nodejs
-npm install -g npm@latest
+apt install nodejs -y
+
+# Install n and switch to the requested version
+npm install -g n
+n "$NODE_VERSION"
+
+# Ensure n-managed binaries take precedence over the apt-installed ones
+export PATH="/usr/local/bin:$PATH"
+hash -r 2>/dev/null || true
+
 npm install -g yarn
 npm install -g prisma
-info "Node.js $(node -v) and npm $(npm -v) installed."
+info "Node.js $(node -v) / npm $(npm -v) installed via n (requested: $NODE_VERSION)."
 
 # ============================================================
 # 10. Process Management — PM2
@@ -209,9 +223,14 @@ cat > "$ECOSYSTEM_FILE" <<EOF
 module.exports = {
   apps: [
     {
-      // Placeholder: replace script/args with the Next.js values after deploying your app:
-      //   script: "npx",
-      //   args: "next start",
+      // Placeholder: update script/interpreter for your app after deploying:
+      //
+      // Next.js:
+      //   script: "npx", args: "next start"
+      //
+      // TypeScript (tsx):
+      //   script: "index.ts", interpreter: "./node_modules/.bin/tsx"
+      //   (or interpreter: "tsx" if tsx is installed globally)
       name: "${APP_NAME}",
       script: "node",
       args: "server.js",
