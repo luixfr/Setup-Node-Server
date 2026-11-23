@@ -1,6 +1,6 @@
 # Production Server Setup
 
-Automated setup script for a production Ubuntu server hosting a Node application. Installs and configures NGINX, Node.js, PM2, Certbot (SSL), a deploy user, and a placeholder page so you can verify the stack is live before deploying your app.
+Automated setup script for a production Ubuntu server hosting a Node application. Installs and configures NGINX, Node.js, PM2, Certbot (SSL), separate admin/deploy/app users, and a placeholder page so you can verify the stack is live before deploying your app.
 
 ## Prerequisites
 
@@ -26,7 +26,12 @@ On your DNS provider:
 
 ### 3. SSH Access
 
-Have your local machine's public key ready to paste when prompted (`~/.ssh/id_rsa.pub` or `~/.ssh/id_ed25519.pub`). You can skip this during setup and add it manually later.
+Have your public keys ready to paste when prompted (`~/.ssh/id_ed25519.pub` or `~/.ssh/id_rsa.pub`):
+
+- **Admin key**: your personal key. If left blank, root's `authorized_keys` (e.g. the key your provider injected) is copied to the admin user.
+- **Deploy key**: the key your CI or deploy machine uses. Ideally a different key from the admin one. Can be added later.
+
+> If the admin user ends up with an SSH key, the script **disables root SSH login and password authentication**. Before closing your root session, confirm `ssh admin@your-domain.com` and `sudo -v` work in a new terminal.
 
 ---
 
@@ -46,9 +51,16 @@ curl -fsSL https://raw.githubusercontent.com/luixfr/Setup-Node-Server/main/setup
 |--------|---------|-------|
 | Domain name | `[YOUR_APP_NAME].example.com` | Must already point to this server's IP |
 | App name | `[YOUR_APP_NAME]` | Used for the app directory (`/var/www/[YOUR_APP_NAME]`) and PM2 process name |
-| Deploy username | `deploy` | Press Enter to use the default |
-| Public SSH key | `ssh-ed25519 AAAA...` | Leave blank to skip |
+| Admin username | `admin` | SSH + sudo for server maintenance |
+| Admin password | | Required by sudo. Only asked when the user is created |
+| Admin SSH public key | `ssh-ed25519 AAAA...` | Leave blank to copy root's `authorized_keys` |
+| Deploy username | `deploy` | Uploads code and restarts the app |
+| Deploy SSH public key | `ssh-ed25519 AAAA...` | Leave blank to skip |
+| App runtime username | `app` | Runs the app process. No login, no sudo |
 | App port | `3000` | Press Enter to use the default |
+| Runtimes | `node` | Any of `node`, `deno`, `bun` |
+| Node.js version | `lts` | Only asked when `node` is selected |
+| SSL email | `you@example.com` | Used by Let's Encrypt |
 
 ---
 
@@ -56,13 +68,27 @@ curl -fsSL https://raw.githubusercontent.com/luixfr/Setup-Node-Server/main/setup
 
 | Component | Purpose |
 |-----------|---------|
-| `deploy` user | Unprivileged user that runs and owns the app |
+| `admin` user | The only sudoer (password required). Use it for server maintenance |
+| `deploy` user | Owns the app code. No sudo. Can only run `pm2` as the `app` user |
+| `app` user | Runs the app via PM2. No login shell, no sudo, read-only access to the code |
 | NGINX (stable, from nginx.org) | Reverse proxy, forwards port 80/443 → app port. Site config: `/etc/nginx/conf.d/<domain>.conf` |
 | Certbot | Obtains and auto-renews a Let's Encrypt SSL certificate |
 | Node.js LTS | JavaScript runtime |
 | yarn, prisma | Global packages for Next.js apps |
-| PM2 | Process manager — keeps the app running and restarts it on boot |
+| PM2 | Process manager, running as `app` (systemd unit `pm2-app`). Keeps the app running and restarts it on boot |
+| SSH hardening | Root login and password auth disabled (only when the admin user has an SSH key) |
 | Placeholder app | Simple Node.js server so you can verify the stack works immediately |
+
+### Security model
+
+| | admin | deploy | app |
+|---|---|---|---|
+| SSH login | ✅ | ✅ | ❌ |
+| sudo | ✅ (password) | ❌ (only `sudo -u app pm2`) | ❌ |
+| Write app code (`/var/www/<app>`) | via sudo | ✅ (owner) | ❌ (read-only via group) |
+| Write NGINX config | via sudo | ❌ | ❌ |
+
+A compromised app can't change its own code, the NGINX config, or escalate to root. Letting `deploy` run `pm2` as `app` adds nothing `deploy` couldn't already do, because it owns the code `app` runs.
 
 ---
 
@@ -81,20 +107,31 @@ From your local machine, push your build to the server and restart PM2:
 rsync -avz --delete .next package.json public deploy@your-domain.com:/var/www/[YOUR_APP_NAME]/
 ```
 
-Then on the server:
+Then on the server, as `deploy`:
 
 ```bash
-# Add your environment variables
-nano /var/www/[YOUR_APP_NAME]/.env
+# Add your environment variables (readable by the app, not by other users)
+nano /var/www/[YOUR_APP_NAME]/.env && chmod 640 /var/www/[YOUR_APP_NAME]/.env
 
 # Update the PM2 config to run your app instead of the placeholder
-nano ~/ecosystem.config.js
+nano /var/www/[YOUR_APP_NAME]/ecosystem.config.js
 # Next.js:       script: "npx",      args: "next start"
 
-pm2 restart [YOUR_APP_NAME] && pm2 save
+# PM2 runs as the app user
+sudo -u app pm2 restart [YOUR_APP_NAME] && sudo -u app pm2 save
 ```
 
+The app user can only **read** the code. If your app writes to disk (e.g. Next.js `.next/cache`, an uploads folder), make only those directories group-writable:
+
+```bash
+chmod -R g+w /var/www/[YOUR_APP_NAME]/.next/cache
+```
+
+> `rsync -a` copies permissions from your local machine, so re-apply this after deploys that recreate the directory.
+
 ### 3. Confirm SSL auto-renewal
+
+As `admin`:
 
 ```bash
 sudo certbot renew --dry-run
@@ -148,7 +185,8 @@ docker compose -f docker-compose.test.yml down
 | `ufw` firewall | Works but is a no-op (container networking bypasses it) |
 | `systemctl` / systemd | Works via privileged mode + systemd init |
 | Certbot SSL cert | Always fails — no real DNS. Expected. |
-| PM2 startup on reboot | Configured but not testable in a container |
+| PM2 startup on reboot | Testable with `systemctl restart pm2-app` (the container uses the host cgroup namespace) |
+| SSH hardening | Skipped unless root has an `authorized_keys` file or you paste an admin key |
 
 ---
 
@@ -157,13 +195,13 @@ docker compose -f docker-compose.test.yml down
 **Certbot failed during setup**
 DNS hadn't propagated yet. Once the domain resolves, run:
 ```bash
-sudo certbot --nginx -d your-domain.com
+sudo certbot --nginx -d your-domain.com   # as admin
 ```
 
 **App not responding**
 Check PM2 logs:
 ```bash
-pm2 logs [YOUR_APP_NAME]
+sudo -u app pm2 logs [YOUR_APP_NAME]   # as deploy
 ```
 
 **NGINX errors**
@@ -174,9 +212,15 @@ sudo journalctl -u nginx --no-pager -n 50
 ```
 
 **PM2 not starting on reboot**
-Run as the deploy user:
+As `admin`:
 ```bash
-pm2 startup
-# Copy and run the command it prints, then:
-pm2 save
+sudo systemctl status pm2-app
+sudo pm2 startup systemd -u app --hp /home/app
 ```
+Then, as `deploy`, save the process list:
+```bash
+sudo -u app pm2 save
+```
+
+**Locked out of SSH**
+Root login and password authentication are disabled once the admin user has a key. Use your provider's web console to log in as root, then fix `/home/admin/.ssh/authorized_keys` or remove `/etc/ssh/sshd_config.d/00-hardening.conf`.
