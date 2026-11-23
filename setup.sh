@@ -149,10 +149,13 @@ info "'$DEPLOY_USER' has no sudo access."
 
 section "2. SSH Configuration"
 
-# Admin keys: provided key, or fall back to root's keys (e.g. the provider-injected key)
+# Admin keys: provided key; otherwise keep existing keys (re-runs); otherwise fall back
+# to root's keys (e.g. the provider-injected key)
 if [[ -n "$ADMIN_SSH_KEY" ]]; then
     install_ssh_keys "$ADMIN_USER" "$ADMIN_SSH_KEY"
     info "SSH key installed for '$ADMIN_USER'."
+elif [[ -s "/home/${ADMIN_USER}/.ssh/authorized_keys" ]]; then
+    info "Keeping existing SSH keys for '$ADMIN_USER'."
 elif [[ -s /root/.ssh/authorized_keys ]]; then
     install_ssh_keys "$ADMIN_USER" "$(cat /root/.ssh/authorized_keys)"
     info "Copied root's authorized_keys to '$ADMIN_USER'."
@@ -163,6 +166,8 @@ fi
 if [[ -n "$DEPLOY_SSH_KEY" ]]; then
     install_ssh_keys "$DEPLOY_USER" "$DEPLOY_SSH_KEY"
     info "SSH key installed for '$DEPLOY_USER'."
+elif [[ -s "/home/${DEPLOY_USER}/.ssh/authorized_keys" ]]; then
+    info "Keeping existing SSH keys for '$DEPLOY_USER'."
 else
     warn "No deploy SSH key provided — skipping. Add one later: /home/${DEPLOY_USER}/.ssh/authorized_keys"
 fi
@@ -210,15 +215,21 @@ section "4. NGINX Installation"
 # package, which often lags behind the current stable release.
 apt install -y curl gnupg2 ca-certificates lsb-release ubuntu-keyring
 
+# Throwaway gpg home: newer gpg (2.4.8+, Ubuntu 26.04) aborts partway through
+# listing keys when ~/.gnupg doesn't exist, which hid the key we verify below.
+NGINX_GNUPGHOME="$(mktemp -d)"
+
 curl -fsSL https://nginx.org/keys/nginx_signing.key \
-    | gpg --dearmor \
+    | GNUPGHOME="$NGINX_GNUPGHOME" gpg --batch --dearmor \
     | tee /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
 
 # Verify the downloaded key matches the fingerprint published on nginx.org
+# (the file holds several nginx signing keys; this is the one the docs say to check)
 NGINX_KEY_FINGERPRINT="573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"
-NGINX_KEY_INFO=$(gpg --dry-run --quiet --no-keyring --import --import-options import-show \
+NGINX_KEY_INFO=$(GNUPGHOME="$NGINX_GNUPGHOME" gpg --batch --with-colons --show-keys \
     /usr/share/keyrings/nginx-archive-keyring.gpg 2>/dev/null || true)
-if grep -q "$NGINX_KEY_FINGERPRINT" <<< "$NGINX_KEY_INFO"; then
+rm -rf "$NGINX_GNUPGHOME"
+if grep -q "^fpr:\+${NGINX_KEY_FINGERPRINT}:" <<< "$NGINX_KEY_INFO"; then
     info "nginx signing key verified ($NGINX_KEY_FINGERPRINT)."
 else
     rm -f /usr/share/keyrings/nginx-archive-keyring.gpg
