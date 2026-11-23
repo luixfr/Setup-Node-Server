@@ -47,8 +47,21 @@ read -rp "Node.js app port [3000]: " APP_PORT
 APP_PORT="${APP_PORT:-3000}"
 
 echo ""
-read -rp "Node.js version [lts]: " NODE_VERSION
-NODE_VERSION="${NODE_VERSION:-lts}"
+info "Available runtimes: node, deno, bun (space-separated, e.g. 'node bun')"
+read -rp "Runtimes to install [node]: " RUNTIMES_INPUT
+RUNTIMES_INPUT="${RUNTIMES_INPUT:-node}"
+read -ra RUNTIMES <<< "$RUNTIMES_INPUT"
+
+NODE_VERSION=""
+if printf '%s\n' "${RUNTIMES[@]}" | grep -q "^node$"; then
+    echo ""
+    read -rp "Node.js version [lts]: " NODE_VERSION
+    NODE_VERSION="${NODE_VERSION:-lts}"
+fi
+
+echo ""
+read -rp "Email for SSL certificate (Let's Encrypt): " SSL_EMAIL
+[[ -z "$SSL_EMAIL" ]] && error "SSL email cannot be empty."
 
 echo ""
 info "Configuration summary:"
@@ -56,7 +69,9 @@ echo "  Domain:      $DOMAIN"
 echo "  App name:    $APP_NAME"
 echo "  Deploy user: $DEPLOY_USER"
 echo "  App port:    $APP_PORT"
-echo "  Node.js:     $NODE_VERSION"
+echo "  Runtimes:    ${RUNTIMES[*]}"
+[[ -n "$NODE_VERSION" ]] && echo "  Node.js ver: $NODE_VERSION"
+echo "  SSL email:   $SSL_EMAIL"
 echo ""
 read -rp "Proceed with setup? [y/N]: " CONFIRM
 [[ "${CONFIRM,,}" != "y" ]] && error "Aborted by user."
@@ -143,26 +158,46 @@ apt install -y certbot python3-certbot-nginx
 info "Certbot installed."
 
 # ============================================================
-# 9. Runtime Environment — Node.js
+# 9. Runtime Installation
 # ============================================================
 
-section "9. Node.js Installation (via n)"
+section "9. Runtime Installation"
 
-# Bootstrap Node.js via nodesource
-curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
-apt install nodejs -y
-
-# Install n and switch to the requested version
-npm install -g n
-n "$NODE_VERSION"
-
-# Ensure n-managed binaries take precedence over the apt-installed ones
-export PATH="/usr/local/bin:$PATH"
-hash -r 2>/dev/null || true
-
-npm install -g yarn
-npm install -g prisma
-info "Node.js $(node -v) / npm $(npm -v) installed via n (requested: $NODE_VERSION)."
+for RUNTIME in "${RUNTIMES[@]}"; do
+    case "$RUNTIME" in
+        node)
+            info "Installing Node.js (via n) — version: $NODE_VERSION ..."
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+            apt install nodejs -y
+            npm install -g n
+            n "$NODE_VERSION"
+            export PATH="/usr/local/bin:$PATH"
+            hash -r 2>/dev/null || true
+            npm install -g yarn
+            npm install -g prisma
+            info "Node.js $(node -v) / npm $(npm -v) installed."
+            ;;
+        deno)
+            info "Installing Deno ..."
+            curl -fsSL https://deno.land/install.sh | sh -s -- --yes
+            DENO_INSTALL="/root/.deno"
+            export PATH="${DENO_INSTALL}/bin:$PATH"
+            ln -sf "${DENO_INSTALL}/bin/deno" /usr/local/bin/deno
+            info "Deno $(deno --version | head -1) installed."
+            ;;
+        bun)
+            info "Installing Bun ..."
+            curl -fsSL https://bun.sh/install | bash
+            BUN_INSTALL="/root/.bun"
+            export PATH="${BUN_INSTALL}/bin:$PATH"
+            ln -sf "${BUN_INSTALL}/bin/bun" /usr/local/bin/bun
+            info "Bun $(bun --version) installed."
+            ;;
+        *)
+            warn "Unknown runtime '$RUNTIME' — skipping."
+            ;;
+    esac
+done
 
 # ============================================================
 # 10. Process Management — PM2
@@ -286,7 +321,7 @@ info "NGINX site configured and reloaded."
 section "14. SSL Certificate"
 
 info "Requesting SSL certificate from Let's Encrypt for $DOMAIN ..."
-certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "admin@${DOMAIN#*.}" --redirect || {
+certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "$SSL_EMAIL" --redirect || {
     warn "Certbot failed. This usually means DNS has not propagated yet."
     warn "Once DNS is ready, run: sudo certbot --nginx -d $DOMAIN"
 }

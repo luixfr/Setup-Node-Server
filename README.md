@@ -1,14 +1,14 @@
 # Production Server Setup
 
-Automated setup script for a production Ubuntu server hosting a Next.js application. Installs and configures NGINX, Node.js, PM2, Certbot (SSL), a deploy user, and a placeholder page so you can verify the stack is live before deploying your app.
+Automated setup script for a production Ubuntu server hosting a Node application. Installs and configures NGINX, Node.js, PM2, Certbot (SSL), a deploy user, and a placeholder page so you can verify the stack is live before deploying your app.
 
 ## Prerequisites
 
 Complete these steps **before** running the script.
 
-### 1. DigitalOcean Droplet
+### 1. Linux server
 
-- Create an Ubuntu 22.04 (or 24.04) Droplet
+- Create a linux server, recommended Ubuntu
 - Note its public IP address
 - Ensure you can SSH in as `root`
 
@@ -16,7 +16,7 @@ Complete these steps **before** running the script.
 
 Point your subdomain at the Droplet's IP address **before** running the script — Certbot needs the domain to resolve for SSL to work.
 
-In Cloudflare (or your DNS provider):
+On your DNS provider:
 
 | Type | Name | Content | Proxy |
 |------|------|---------|-------|
@@ -90,7 +90,6 @@ nano /var/www/[YOUR_APP_NAME]/.env
 # Update the PM2 config to run your app instead of the placeholder
 nano ~/ecosystem.config.js
 # Next.js:       script: "npx",      args: "next start"
-# TypeScript:    script: "index.ts", interpreter: "./node_modules/.bin/tsx"
 
 pm2 restart [YOUR_APP_NAME] && pm2 save
 ```
