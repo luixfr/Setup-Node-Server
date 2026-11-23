@@ -3,11 +3,11 @@ set -euo pipefail
 
 # ============================================================
 # add-app — add an application to a server prepared by setup.sh
-# Usage (as the admin user): sudo add-app
+# Usage (as the admin user, e.g. ops): sudo add-app
 #
 # Each app gets its own isolated user and PM2 daemon:
-#   user app-<name> (no login, no sudo), code in /var/www/<name>,
-#   systemd unit pm2-app-<name>, NGINX site, SSL certificate.
+#   user <name> (no login, no sudo), code in /var/www/<name>,
+#   systemd unit pm2-<name>, NGINX site, SSL certificate.
 # ============================================================
 
 RED='\033[0;31m'
@@ -64,17 +64,19 @@ domain_in_use() {
 section "Add App"
 
 read -rp "App name (lowercase letters, digits, '-'; e.g. my-app): " APP_NAME
-[[ "$APP_NAME" =~ ^[a-z][a-z0-9-]{0,27}$ ]] \
-    || error "Invalid app name. Use 1–28 chars: lowercase letters, digits and '-', starting with a letter."
+[[ "$APP_NAME" =~ ^[a-z][a-z0-9-]{0,31}$ ]] \
+    || error "Invalid app name. Use 1–32 chars: lowercase letters, digits and '-', starting with a letter."
 
-APP_USER="app-${APP_NAME}"
+# The app's Linux user is named after the app
+APP_USER="${APP_NAME}"
 APP_HOME="/home/${APP_USER}"
 APP_DIR="/var/www/${APP_NAME}"
 ECOSYSTEM_FILE="${APP_DIR}/ecosystem.config.js"
 PM2_UNIT="pm2-${APP_USER}"
 DEPLOY_SUDOERS="/etc/sudoers.d/${DEPLOY_USER}-${APP_USER}"
 
-id "$APP_USER" &>/dev/null && error "User '$APP_USER' already exists — is '$APP_NAME' already set up?"
+id "$APP_USER" &>/dev/null && error "A user named '$APP_USER' already exists (an existing app or a system user). Choose another app name."
+getent group "$APP_USER" >/dev/null && error "A group named '$APP_USER' already exists. Choose another app name."
 [[ -e "$APP_DIR" ]] && error "$APP_DIR already exists — is '$APP_NAME' already set up?"
 
 read -rp "Domain name (e.g. my-app.example.com): " DOMAIN
@@ -181,7 +183,7 @@ info "Created $APP_DIR (owner: $DEPLOY_USER, group: $APP_USER, mode 2750) with p
 
 section "3. PM2"
 
-# systemd unit pm2-app-<name> starts this app's PM2 daemon on boot
+# systemd unit pm2-<name> starts this app's PM2 daemon on boot
 if pm2 startup systemd -u "$APP_USER" --hp "$APP_HOME"; then
     systemctl start "$PM2_UNIT" || true
     info "PM2 startup configured (systemd unit: $PM2_UNIT)."
@@ -277,7 +279,7 @@ echo ""
 echo "  3. Add your .env variables on the server (as ${DEPLOY_USER}):"
 echo "       nano ${APP_DIR}/.env && chmod 640 ${APP_DIR}/.env"
 echo ""
-echo "  4. Test certificate auto-renewal (as admin):"
+echo "  4. Test certificate auto-renewal (as the admin user):"
 echo "       sudo certbot renew --dry-run"
 echo ""
 info "Placeholder is live at http://${DOMAIN}"

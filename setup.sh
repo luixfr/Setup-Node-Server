@@ -8,9 +8,10 @@ set -euo pipefail
 # Prepares the server (users, SSH, NGINX, Certbot, runtimes, PM2) and installs
 # `add-app`, which adds each application with its own isolated user:
 #
-#   admin       — SSH + sudo (password required) for server maintenance
-#   deploy      — SSH, owns app code, may only run pm2 as each app's user
-#   app-<name>  — one per app (created by add-app): no login, no sudo
+#   ops     — SSH (key only) + passwordless sudo, for server maintenance
+#   deploy  — SSH, owns app code, may only run pm2 as each app's user
+#   <name>  — one user per app, named after the app (created by add-app):
+#             no login, no sudo
 # ============================================================
 
 RED='\033[0;31m'
@@ -43,18 +44,8 @@ command -v apt >/dev/null 2>&1 || error "This script requires an apt-based Linux
 
 section "Configuration"
 
-read -rp "Admin username (SSH + sudo, for server maintenance) [admin]: " ADMIN_USER
-ADMIN_USER="${ADMIN_USER:-admin}"
-
-if id "$ADMIN_USER" &>/dev/null; then
-    ADMIN_PASSWORD=""
-    info "User '$ADMIN_USER' already exists — keeping its current password."
-else
-    read -rsp "Password for '$ADMIN_USER' (required for sudo): " ADMIN_PASSWORD; echo ""
-    [[ -z "$ADMIN_PASSWORD" ]] && error "Admin password cannot be empty."
-    read -rsp "Confirm password: " ADMIN_PASSWORD_CONFIRM; echo ""
-    [[ "$ADMIN_PASSWORD" != "$ADMIN_PASSWORD_CONFIRM" ]] && error "Passwords do not match."
-fi
+read -rp "Admin username (SSH + sudo, for server maintenance) [ops]: " ADMIN_USER
+ADMIN_USER="${ADMIN_USER:-ops}"
 
 read -rp "Admin SSH public key (leave blank to copy root's authorized_keys): " ADMIN_SSH_KEY
 
@@ -67,7 +58,6 @@ read -rp "Deploy SSH public key (leave blank to skip): " DEPLOY_SSH_KEY
 [[ "$ADMIN_USER" == "$DEPLOY_USER" ]] && error "Admin and deploy users must be different."
 for U in "$ADMIN_USER" "$DEPLOY_USER"; do
     [[ "$U" == "root" ]] && error "'root' cannot be used as the admin or deploy user."
-    [[ "$U" == app-* ]] && error "'app-*' usernames are reserved for app users."
 done
 
 echo ""
@@ -125,17 +115,20 @@ fetch_file() {
 
 section "1. User Management"
 
-# --- Admin: the only user with sudo, and it requires a password ---
+# --- Admin: the only user with sudo. No password: it logs in with an SSH key only,
+# so its key is effectively root access — keep it safe. ---
 if id "$ADMIN_USER" &>/dev/null; then
     warn "User '$ADMIN_USER' already exists, skipping creation."
 else
+    # useradd leaves the password locked, so password login is impossible
     useradd -m -U -s /bin/bash "$ADMIN_USER"
-    echo "${ADMIN_USER}:${ADMIN_PASSWORD}" | chpasswd
-    info "Created admin user '$ADMIN_USER'."
+    info "Created admin user '$ADMIN_USER' (no password, SSH key login only)."
 fi
-unset ADMIN_PASSWORD ADMIN_PASSWORD_CONFIRM
-usermod -aG sudo "$ADMIN_USER"
-info "'$ADMIN_USER' can use sudo (password required)."
+ADMIN_SUDOERS="/etc/sudoers.d/${ADMIN_USER}"
+echo "${ADMIN_USER} ALL=(ALL) NOPASSWD: ALL" > "$ADMIN_SUDOERS"
+chmod 440 "$ADMIN_SUDOERS"
+visudo -cf "$ADMIN_SUDOERS" >/dev/null || { rm -f "$ADMIN_SUDOERS"; error "Invalid sudoers rule for $ADMIN_USER."; }
+info "'$ADMIN_USER' can use sudo without a password."
 
 # --- Deploy: owns the code, no sudo (per-app pm2 rules are added by add-app) ---
 if id "$DEPLOY_USER" &>/dev/null; then
@@ -373,7 +366,7 @@ fi
 echo ""
 if [[ "$SSH_HARDENED" == true ]]; then
     warn "Root SSH login is now DISABLED. Before closing this session, verify in a new terminal:"
-    echo "       ssh ${ADMIN_USER}@<server>   (then: sudo -v)"
+    echo "       ssh ${ADMIN_USER}@<server>   (then: sudo -n true)"
     echo ""
 fi
 info "Logins:"
