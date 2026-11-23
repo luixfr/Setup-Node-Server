@@ -57,7 +57,7 @@ curl -fsSL https://raw.githubusercontent.com/luixfr/Setup-Node-Server/main/setup
 | Component | Purpose |
 |-----------|---------|
 | `deploy` user | Unprivileged user that runs and owns the app |
-| NGINX | Reverse proxy, forwards port 80/443 → app port |
+| NGINX (stable, from nginx.org) | Reverse proxy, forwards port 80/443 → app port. Site config: `/etc/nginx/conf.d/<domain>.conf` |
 | Certbot | Obtains and auto-renews a Let's Encrypt SSL certificate |
 | Node.js LTS | JavaScript runtime |
 | yarn, prisma | Global packages for Next.js apps |

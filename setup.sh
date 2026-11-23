@@ -132,16 +132,50 @@ info "System packages updated."
 
 section "7. NGINX Installation"
 
-apt install -y nginx
+# Install the stable branch from the official nginx.org repository
+# (https://nginx.org/en/linux_packages.html#Ubuntu) instead of Ubuntu's
+# package, which often lags behind the current stable release.
+apt install -y curl gnupg2 ca-certificates lsb-release ubuntu-keyring
 
+curl -fsSL https://nginx.org/keys/nginx_signing.key \
+    | gpg --dearmor \
+    | tee /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
+
+# Verify the downloaded key matches the fingerprint published on nginx.org
+NGINX_KEY_FINGERPRINT="573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"
+NGINX_KEY_INFO=$(gpg --dry-run --quiet --no-keyring --import --import-options import-show \
+    /usr/share/keyrings/nginx-archive-keyring.gpg 2>/dev/null || true)
+if grep -q "$NGINX_KEY_FINGERPRINT" <<< "$NGINX_KEY_INFO"; then
+    info "nginx signing key verified ($NGINX_KEY_FINGERPRINT)."
+else
+    rm -f /usr/share/keyrings/nginx-archive-keyring.gpg
+    error "nginx signing key fingerprint mismatch. Check https://nginx.org/en/linux_packages.html#Ubuntu"
+fi
+
+echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" \
+    > /etc/apt/sources.list.d/nginx.list
+
+# Prefer nginx.org packages over the distribution-provided ones
+printf "Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n" \
+    > /etc/apt/preferences.d/99nginx
+
+apt update -y
+apt install -y nginx
+info "Installed $(nginx -v 2>&1)"
+
+# nginx.org packages load site configs from conf.d/*.conf (no sites-available/sites-enabled)
 chown -R root:"$DEPLOY_USER" /etc/nginx/
-chmod -R 775 /etc/nginx/sites-available
-chmod -R 775 /etc/nginx/sites-enabled
+chmod -R 775 /etc/nginx/conf.d
+
+# Remove the stock welcome page so only our site config is served
+rm -f /etc/nginx/conf.d/default.conf
 
 systemctl start nginx
 systemctl enable nginx
 
-ufw allow 'Nginx Full'
+# nginx.org packages don't ship a ufw app profile, so open ports directly
+ufw allow 80/tcp
+ufw allow 443/tcp
 ufw allow 22/tcp
 ufw --force enable
 
@@ -289,7 +323,7 @@ info "PM2 ecosystem config written to $ECOSYSTEM_FILE"
 
 section "13. NGINX Site Configuration"
 
-NGINX_CONF="/etc/nginx/sites-available/${DOMAIN}"
+NGINX_CONF="/etc/nginx/conf.d/${DOMAIN}.conf"
 # Only the HTTP block — certbot will add the redirect and the 443 SSL block
 cat > "$NGINX_CONF" <<EOF
 server {
@@ -307,8 +341,6 @@ server {
     }
 }
 EOF
-
-ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/
 
 nginx -t || error "NGINX configuration test failed. Check $NGINX_CONF"
 systemctl restart nginx
