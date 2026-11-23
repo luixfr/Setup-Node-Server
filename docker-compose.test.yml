@@ -12,6 +12,7 @@ services:
       # Live-reload the script without rebuilding the image
       - ./setup.sh:/root/setup.sh
       - ./add-app.sh:/root/add-app.sh
+      - ./remove-app.sh:/root/remove-app.sh
       - ./placeholder.js:/root/placeholder.js
     ports:
       - "8080:80"

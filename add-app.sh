@@ -24,6 +24,7 @@ REPO_RAW_URL="https://raw.githubusercontent.com/luixfr/Setup-Node-Server/main"
 CONFIG_FILE="/etc/server-setup.conf"
 PLACEHOLDER_FILE="/usr/local/share/server-setup/placeholder.js"
 NGINX_CONF_DIR="/etc/nginx/conf.d"
+APPS_DIR="/var/lib/server-setup/apps"
 
 # ============================================================
 # Pre-flight checks
@@ -78,6 +79,7 @@ DEPLOY_SUDOERS="/etc/sudoers.d/${DEPLOY_USER}-${APP_USER}"
 id "$APP_USER" &>/dev/null && error "A user named '$APP_USER' already exists (an existing app or a system user). Choose another app name."
 getent group "$APP_USER" >/dev/null && error "A group named '$APP_USER' already exists. Choose another app name."
 [[ -e "$APP_DIR" ]] && error "$APP_DIR already exists — is '$APP_NAME' already set up?"
+[[ -e "${APPS_DIR}/${APP_NAME}.conf" ]] && error "'$APP_NAME' is already registered (${APPS_DIR}/${APP_NAME}.conf). Remove it first: sudo remove-app $APP_NAME"
 
 read -rp "Domain name (e.g. my-app.example.com): " DOMAIN
 [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || error "Invalid domain name."
@@ -108,6 +110,21 @@ echo "  Deploy user: $DEPLOY_USER"
 echo ""
 read -rp "Create this app? [y/N]: " CONFIRM
 [[ "${CONFIRM,,}" != "y" ]] && error "Aborted by user."
+
+# Record the app before creating anything, so remove-app can undo exactly what was
+# created — including after a run that failed halfway.
+mkdir -p "$APPS_DIR"
+chmod 755 "$APPS_DIR"
+{
+    echo "# Written by add-app — read by remove-app"
+    printf 'APP_NAME=%q\n' "$APP_NAME"
+    printf 'APP_USER=%q\n' "$APP_USER"
+    printf 'DOMAIN=%q\n' "$DOMAIN"
+    printf 'APP_PORT=%q\n' "$APP_PORT"
+    printf 'DEPLOY_USER=%q\n' "$DEPLOY_USER"
+    printf 'CREATED=%q\n' "$(date -Iseconds)"
+} > "${APPS_DIR}/${APP_NAME}.conf"
+chmod 644 "${APPS_DIR}/${APP_NAME}.conf"
 
 # Run a command as the app user (which has no login shell) with its own PM2 home
 as_app() {

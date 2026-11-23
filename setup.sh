@@ -29,6 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="/etc/server-setup.conf"
 SHARE_DIR="/usr/local/share/server-setup"
 ADD_APP_BIN="/usr/local/sbin/add-app"
+REMOVE_APP_BIN="/usr/local/sbin/remove-app"
 
 # ============================================================
 # Pre-flight checks
@@ -328,14 +329,15 @@ npm install -g pm2
 info "PM2 installed."
 
 # ============================================================
-# 8. Install add-app
+# 8. Install add-app and remove-app
 # ============================================================
 
-section "8. Installing add-app"
+section "8. Installing add-app and remove-app"
 
 mkdir -p "$SHARE_DIR"
 fetch_file "add-app.sh" "$ADD_APP_BIN"
-chmod 755 "$ADD_APP_BIN"
+fetch_file "remove-app.sh" "$REMOVE_APP_BIN"
+chmod 755 "$ADD_APP_BIN" "$REMOVE_APP_BIN"
 fetch_file "placeholder.js" "${SHARE_DIR}/placeholder.js"
 chmod 644 "${SHARE_DIR}/placeholder.js"
 
@@ -347,7 +349,7 @@ chmod 644 "${SHARE_DIR}/placeholder.js"
 } > "$CONFIG_FILE"
 chmod 644 "$CONFIG_FILE"
 
-info "Installed $ADD_APP_BIN (settings in $CONFIG_FILE)."
+info "Installed $ADD_APP_BIN and $REMOVE_APP_BIN (settings in $CONFIG_FILE)."
 
 # ============================================================
 # Done — optionally add the first app

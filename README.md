@@ -1,6 +1,6 @@
 # Production Server Setup
 
-Automated setup for a production Ubuntu server hosting one or more Node applications. `setup.sh` prepares the server once (NGINX, Node.js, PM2, Certbot, ops/deploy users, SSH hardening). `add-app` then adds each application with its own isolated user, PM2 daemon, NGINX site, SSL certificate and a placeholder page, so you can verify it's live before deploying.
+Automated setup for a production Ubuntu server hosting one or more Node applications. `setup.sh` prepares the server once (NGINX, Node.js, PM2, Certbot, ops/deploy users, SSH hardening). `add-app` then adds each application with its own isolated user, PM2 daemon, NGINX site, SSL certificate and a placeholder page, so you can verify it's live before deploying. `remove-app` undoes everything `add-app` created for an app.
 
 ## Prerequisites
 
@@ -37,7 +37,7 @@ Have your public keys ready to paste when prompted (`~/.ssh/id_ed25519.pub` or `
 
 ## Run the Script
 
-SSH into the server as root, then download and run the setup script. It fetches `add-app` and the placeholder from this repository:
+SSH into the server as root, then download and run the setup script. It fetches `add-app`, `remove-app` and the placeholder from this repository:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/luixfr/Setup-Node-Server/main/setup.sh -o setup.sh && bash setup.sh
@@ -54,6 +54,26 @@ sudo add-app
 ```
 
 Each run creates one fully isolated app. Run it again for every app you host on the server.
+
+### Removing an app
+
+As the admin user:
+
+```bash
+sudo remove-app [YOUR_APP_NAME]   # or just `sudo remove-app` to pick from a list
+```
+
+It shows everything it will remove and asks you to type the app name to confirm. It then:
+
+1. Optionally saves a backup to `/root/app-backups/<name>-<timestamp>.tar.gz` (code, `.env`, PM2 logs, NGINX site). The archive is readable only by root, since it contains secrets.
+2. Stops the app's PM2 daemon and every process running as the app user, and removes the `pm2-<name>` systemd unit.
+3. Removes deploy's sudo rule for the app and its membership in the app's group.
+4. Removes the NGINX site and reloads NGINX, then deletes the Let's Encrypt certificate.
+5. Deletes `/var/www/<name>` and the `<name>` user, group and home directory.
+
+Other apps aren't affected, and the name, domain and port can be reused straight away. Remove the app's DNS record yourself if you no longer need it.
+
+`remove-app` only removes apps that `add-app` created: each app is recorded in `/var/lib/server-setup/apps/<name>.conf` when it's added. It refuses to delete root, the deploy user, any sudoer or any user with a login shell. If `add-app` fails halfway, run `remove-app` with the same name to clean up what it created.
 
 ---
 
@@ -96,7 +116,7 @@ Each run creates one fully isolated app. Run it again for every app you host on 
 | yarn, prisma | Global packages for Next.js apps |
 | PM2 | Process manager (each app runs its own PM2 daemon) |
 | SSH hardening | Root login and password auth disabled (only when the admin user has an SSH key) |
-| `add-app` | Installed at `/usr/local/sbin/add-app`. Settings in `/etc/server-setup.conf` |
+| `add-app`, `remove-app` | Installed in `/usr/local/sbin/`. Settings in `/etc/server-setup.conf`, one record per app in `/var/lib/server-setup/apps/` |
 
 ### Per app (`add-app`)
 
@@ -109,6 +129,7 @@ Each run creates one fully isolated app. Run it again for every app you host on 
 | NGINX site | `/etc/nginx/conf.d/<domain>.conf`, proxying to the app's port |
 | SSL certificate | Requested from Let's Encrypt, with HTTP → HTTPS redirect |
 | Placeholder app | Simple Node.js server so you can verify the stack works immediately |
+| App record | `/var/lib/server-setup/apps/<name>.conf`: name, domain, port. Used by `remove-app` |
 
 ### Security model
 
@@ -273,8 +294,9 @@ This starts a privileged Ubuntu 22.04 container with systemd as init. Port `8080
 ```bash
 docker exec -it droplet-test bash
 bash /root/setup.sh
-# Add more apps afterwards with:
+# Add or remove apps afterwards with:
 add-app
+remove-app <name>
 ```
 
 When prompted, use any value for the domain (e.g. `test.example.com`) — Certbot will fail gracefully since there's no real DNS, but everything else runs to completion.
@@ -291,7 +313,7 @@ You should see the "Server is ready" page served through NGINX → PM2 → Node.
 
 ### Iterate without rebuilding
 
-`setup.sh`, `add-app.sh` and `placeholder.js` are volume-mounted into the container, so edits you make locally are reflected immediately — just re-run the script inside the container without rebuilding the image. `setup.sh` uses these local copies instead of downloading them.
+`setup.sh`, `add-app.sh`, `remove-app.sh` and `placeholder.js` are volume-mounted into the container, so edits you make locally are reflected immediately — just re-run the script inside the container without rebuilding the image. `setup.sh` uses these local copies instead of downloading them.
 
 ### Tear down
 
@@ -345,6 +367,9 @@ sudo -u [YOUR_APP_NAME] pm2 save
 
 **`add-app` says the app, domain or port is already in use**
 Each app needs a unique name, domain and port. `add-app` checks the existing users, `/var/www`, the NGINX sites in `/etc/nginx/conf.d` and listening ports. It stops before changing anything.
+
+**`add-app` failed halfway**
+Run `sudo remove-app <name>` to remove whatever it created, fix the cause, then run `add-app` again.
 
 **Locked out of SSH**
 Root login and password authentication are disabled once the admin user has a key. Use your provider's web console to log in as root, then fix `/home/ops/.ssh/authorized_keys` or remove `/etc/ssh/sshd_config.d/00-hardening.conf`.
