@@ -2,8 +2,16 @@
 set -euo pipefail
 
 # ============================================================
-# Production Server Setup Script
-# Run as root on a fresh Ubuntu DigitalOcean Droplet
+# Production Server Setup Script — run ONCE per server
+# Run as root on a fresh Ubuntu server.
+#
+# Prepares the server (users, SSH, NGINX, Certbot, runtimes, PM2) and installs
+# `add-app`, which adds each application with its own isolated user:
+#
+#   ops     — SSH (key only) + passwordless sudo, for server maintenance
+#   deploy  — SSH, owns app code, may only run pm2 as each app's user
+#   <name>  — one user per app, named after the app (created by add-app):
+#             no login, no sudo
 # ============================================================
 
 RED='\033[0;31m'
@@ -15,6 +23,13 @@ info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 section() { echo -e "\n${GREEN}========================================${NC}"; echo -e "${GREEN} $*${NC}"; echo -e "${GREEN}========================================${NC}"; }
+
+REPO_RAW_URL="https://raw.githubusercontent.com/luixfr/Setup-Node-Server/main"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="/etc/server-setup.conf"
+SHARE_DIR="/usr/local/share/server-setup"
+ADD_APP_BIN="/usr/local/sbin/add-app"
+REMOVE_APP_BIN="/usr/local/sbin/remove-app"
 
 # ============================================================
 # Pre-flight checks
@@ -30,81 +45,154 @@ command -v apt >/dev/null 2>&1 || error "This script requires an apt-based Linux
 
 section "Configuration"
 
-read -rp "Domain name (e.g. my-new-app.domain-name.com): " DOMAIN
-[[ -z "$DOMAIN" ]] && error "Domain name cannot be empty."
+read -rp "Admin username (SSH + sudo, for server maintenance) [ops]: " ADMIN_USER
+ADMIN_USER="${ADMIN_USER:-ops}"
 
-read -rp "App name (used for directories and PM2, e.g. my-new-app): " APP_NAME
-[[ -z "$APP_NAME" ]] && error "App name cannot be empty."
+read -rp "Admin SSH public key (leave blank to copy root's authorized_keys): " ADMIN_SSH_KEY
 
-read -rp "Deploy username [deploy]: " DEPLOY_USER
+echo ""
+read -rp "Deploy username (uploads code, restarts apps) [deploy]: " DEPLOY_USER
 DEPLOY_USER="${DEPLOY_USER:-deploy}"
 
-echo ""
-read -rp "Public SSH key (leave blank to skip): " SSH_PUBLIC_KEY
+read -rp "Deploy SSH public key (leave blank to skip): " DEPLOY_SSH_KEY
+
+[[ "$ADMIN_USER" == "$DEPLOY_USER" ]] && error "Admin and deploy users must be different."
+for U in "$ADMIN_USER" "$DEPLOY_USER"; do
+    [[ "$U" == "root" ]] && error "'root' cannot be used as the admin or deploy user."
+done
 
 echo ""
-read -rp "Node.js app port [3000]: " APP_PORT
-APP_PORT="${APP_PORT:-3000}"
+info "Available runtimes: node, deno, bun (space-separated, e.g. 'node bun')"
+read -rp "Runtimes to install [node]: " RUNTIMES_INPUT
+RUNTIMES_INPUT="${RUNTIMES_INPUT:-node}"
+read -ra RUNTIMES <<< "$RUNTIMES_INPUT"
+
+NODE_VERSION=""
+if printf '%s\n' "${RUNTIMES[@]}" | grep -q "^node$"; then
+    echo ""
+    read -rp "Node.js version [lts]: " NODE_VERSION
+    NODE_VERSION="${NODE_VERSION:-lts}"
+fi
 
 echo ""
-read -rp "Node.js version [lts]: " NODE_VERSION
-NODE_VERSION="${NODE_VERSION:-lts}"
+read -rp "Default email for SSL certificates (Let's Encrypt): " SSL_EMAIL
+[[ -z "$SSL_EMAIL" ]] && error "SSL email cannot be empty."
 
 echo ""
 info "Configuration summary:"
-echo "  Domain:      $DOMAIN"
-echo "  App name:    $APP_NAME"
+echo "  Admin user:  $ADMIN_USER"
 echo "  Deploy user: $DEPLOY_USER"
-echo "  App port:    $APP_PORT"
-echo "  Node.js:     $NODE_VERSION"
+echo "  Runtimes:    ${RUNTIMES[*]}"
+[[ -n "$NODE_VERSION" ]] && echo "  Node.js ver: $NODE_VERSION"
+echo "  SSL email:   $SSL_EMAIL"
 echo ""
 read -rp "Proceed with setup? [y/N]: " CONFIRM
 [[ "${CONFIRM,,}" != "y" ]] && error "Aborted by user."
 
-APP_DIR="/var/www/${APP_NAME}"
+# Write an authorized_keys file for a user
+install_ssh_keys() {
+    local user="$1" keys="$2"
+    local ssh_dir="/home/${user}/.ssh"
+    mkdir -p "$ssh_dir"
+    printf '%s\n' "$keys" > "${ssh_dir}/authorized_keys"
+    chmod 700 "$ssh_dir"
+    chmod 600 "${ssh_dir}/authorized_keys"
+    chown -R "${user}:${user}" "$ssh_dir"
+}
+
+# Use a file shipped next to this script if present, otherwise download it from the repo
+fetch_file() {
+    local name="$1" dest="$2"
+    if [[ -f "${SCRIPT_DIR}/${name}" ]]; then
+        cp "${SCRIPT_DIR}/${name}" "$dest"
+    else
+        curl -fsSL "${REPO_RAW_URL}/${name}" -o "$dest" || error "Failed to download ${REPO_RAW_URL}/${name}"
+    fi
+}
 
 # ============================================================
-# 4. User Management
+# 1. User Management
 # ============================================================
 
-section "4. User Management"
+section "1. User Management"
 
+# --- Admin: the only user with sudo. No password: it logs in with an SSH key only,
+# so its key is effectively root access — keep it safe. ---
+if id "$ADMIN_USER" &>/dev/null; then
+    warn "User '$ADMIN_USER' already exists, skipping creation."
+else
+    # useradd leaves the password locked, so password login is impossible
+    useradd -m -U -s /bin/bash "$ADMIN_USER"
+    info "Created admin user '$ADMIN_USER' (no password, SSH key login only)."
+fi
+ADMIN_SUDOERS="/etc/sudoers.d/${ADMIN_USER}"
+echo "${ADMIN_USER} ALL=(ALL) NOPASSWD: ALL" > "$ADMIN_SUDOERS"
+chmod 440 "$ADMIN_SUDOERS"
+visudo -cf "$ADMIN_SUDOERS" >/dev/null || { rm -f "$ADMIN_SUDOERS"; error "Invalid sudoers rule for $ADMIN_USER."; }
+info "'$ADMIN_USER' can use sudo without a password."
+
+# --- Deploy: owns the code, no sudo (per-app pm2 rules are added by add-app) ---
 if id "$DEPLOY_USER" &>/dev/null; then
     warn "User '$DEPLOY_USER' already exists, skipping creation."
 else
-    groupadd "$DEPLOY_USER" 2>/dev/null || true
-    useradd -m -g "$DEPLOY_USER" -s /bin/bash "$DEPLOY_USER"
-    info "Created user '$DEPLOY_USER'."
+    useradd -m -U -s /bin/bash "$DEPLOY_USER"
+    info "Created deploy user '$DEPLOY_USER'."
+fi
+# Revoke any full sudo access left over from earlier versions of this script
+gpasswd -d "$DEPLOY_USER" sudo &>/dev/null || true
+rm -f "/etc/sudoers.d/${DEPLOY_USER}"
+info "'$DEPLOY_USER' has no sudo access."
+
+# ============================================================
+# 2. SSH Configuration
+# ============================================================
+
+section "2. SSH Configuration"
+
+# Admin keys: provided key, or fall back to root's keys (e.g. the provider-injected key)
+if [[ -n "$ADMIN_SSH_KEY" ]]; then
+    install_ssh_keys "$ADMIN_USER" "$ADMIN_SSH_KEY"
+    info "SSH key installed for '$ADMIN_USER'."
+elif [[ -s /root/.ssh/authorized_keys ]]; then
+    install_ssh_keys "$ADMIN_USER" "$(cat /root/.ssh/authorized_keys)"
+    info "Copied root's authorized_keys to '$ADMIN_USER'."
+else
+    warn "No SSH key available for '$ADMIN_USER'."
 fi
 
-usermod -aG sudo "$DEPLOY_USER"
-echo "${DEPLOY_USER} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/"$DEPLOY_USER"
-chmod 440 /etc/sudoers.d/"$DEPLOY_USER"
-info "Sudo access configured for '$DEPLOY_USER' (no password required)."
-
-# ============================================================
-# 5. SSH Configuration
-# ============================================================
-
-section "5. SSH Configuration"
-
-if [[ -n "$SSH_PUBLIC_KEY" ]]; then
-    SSH_DIR="/home/${DEPLOY_USER}/.ssh"
-    mkdir -p "$SSH_DIR"
-    echo "$SSH_PUBLIC_KEY" > "${SSH_DIR}/authorized_keys"
-    chmod 700 "$SSH_DIR"
-    chmod 600 "${SSH_DIR}/authorized_keys"
-    chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "$SSH_DIR"
+if [[ -n "$DEPLOY_SSH_KEY" ]]; then
+    install_ssh_keys "$DEPLOY_USER" "$DEPLOY_SSH_KEY"
     info "SSH key installed for '$DEPLOY_USER'."
 else
-    warn "No SSH key provided — skipping. Add one later: nano /home/${DEPLOY_USER}/.ssh/authorized_keys"
+    warn "No deploy SSH key provided — skipping. Add one later: /home/${DEPLOY_USER}/.ssh/authorized_keys"
+fi
+
+# Harden sshd only if the admin can log in with a key, so we never lock ourselves out
+SSH_HARDENED=false
+if [[ -s "/home/${ADMIN_USER}/.ssh/authorized_keys" ]] && [[ -d /etc/ssh/sshd_config.d ]]; then
+    # sshd uses the first value it reads, so this must sort before e.g. 50-cloud-init.conf
+    cat > /etc/ssh/sshd_config.d/00-hardening.conf <<EOF
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+EOF
+    if sshd -t; then
+        systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+        SSH_HARDENED=true
+        info "SSH hardened: root login and password authentication disabled."
+    else
+        rm -f /etc/ssh/sshd_config.d/00-hardening.conf
+        warn "sshd config test failed — SSH hardening skipped."
+    fi
+else
+    warn "Skipping SSH hardening (root login stays enabled) because '$ADMIN_USER' has no SSH key."
 fi
 
 # ============================================================
-# 6. System Updates
+# 3. System Updates
 # ============================================================
 
-section "6. System Updates"
+section "3. System Updates"
 
 apt update -y
 DEBIAN_FRONTEND=noninteractive apt upgrade -y
@@ -112,21 +200,68 @@ apt autoremove -y
 info "System packages updated."
 
 # ============================================================
-# 7. Web Server Installation
+# 4. Web Server Installation
 # ============================================================
 
-section "7. NGINX Installation"
+section "4. NGINX Installation"
 
+# Install the stable branch from the official nginx.org repository
+# (https://nginx.org/en/linux_packages.html#Ubuntu) instead of Ubuntu's
+# package, which often lags behind the current stable release.
+apt install -y curl gnupg2 ca-certificates lsb-release ubuntu-keyring
+
+curl -fsSL https://nginx.org/keys/nginx_signing.key \
+    | gpg --dearmor \
+    | tee /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
+
+# Verify the downloaded key matches the fingerprint published on nginx.org
+NGINX_KEY_FINGERPRINT="573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"
+NGINX_KEY_INFO=$(gpg --dry-run --quiet --no-keyring --import --import-options import-show \
+    /usr/share/keyrings/nginx-archive-keyring.gpg 2>/dev/null || true)
+if grep -q "$NGINX_KEY_FINGERPRINT" <<< "$NGINX_KEY_INFO"; then
+    info "nginx signing key verified ($NGINX_KEY_FINGERPRINT)."
+else
+    rm -f /usr/share/keyrings/nginx-archive-keyring.gpg
+    error "nginx signing key fingerprint mismatch. Check https://nginx.org/en/linux_packages.html#Ubuntu"
+fi
+
+echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" \
+    > /etc/apt/sources.list.d/nginx.list
+
+# Prefer nginx.org packages over the distribution-provided ones
+printf "Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n" \
+    > /etc/apt/preferences.d/99nginx
+
+apt update -y
 apt install -y nginx
+info "Installed $(nginx -v 2>&1)"
 
-chown -R root:"$DEPLOY_USER" /etc/nginx/
-chmod -R 775 /etc/nginx/sites-available
-chmod -R 775 /etc/nginx/sites-enabled
+# NGINX config stays root-owned; only the admin (via sudo) may change it.
+# nginx.org packages load site configs from conf.d/*.conf (no sites-available/sites-enabled)
+chown -R root:root /etc/nginx/
+
+# Replace the stock welcome page with a catch-all that rejects requests for unknown
+# hosts (e.g. scans of the bare IP), so they never reach one of the apps by accident.
+rm -f /etc/nginx/conf.d/default.conf
+cat > /etc/nginx/conf.d/00-default.conf <<'EOF'
+# Catch-all for requests that don't match any app's server_name
+server {
+    listen 80 default_server;
+    listen 443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+    return 444;
+}
+EOF
+nginx -t || error "NGINX configuration test failed."
 
 systemctl start nginx
 systemctl enable nginx
+systemctl reload nginx
 
-ufw allow 'Nginx Full'
+# nginx.org packages don't ship a ufw app profile, so open ports directly
+ufw allow 80/tcp
+ufw allow 443/tcp
 ufw allow 22/tcp
 ufw --force enable
 
@@ -134,196 +269,108 @@ info "NGINX installed and firewall configured."
 ufw status
 
 # ============================================================
-# 8. SSL Certificate Setup (Certbot install only)
+# 5. SSL Certificate Setup (Certbot install only)
 # ============================================================
 
-section "8. Certbot Installation"
+section "5. Certbot Installation"
 
 apt install -y certbot python3-certbot-nginx
 info "Certbot installed."
 
 # ============================================================
-# 9. Runtime Environment — Node.js
+# 6. Runtime Installation
 # ============================================================
 
-section "9. Node.js Installation (via n)"
+section "6. Runtime Installation"
 
-# Bootstrap Node.js via nodesource
-curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
-apt install nodejs -y
-
-# Install n and switch to the requested version
-npm install -g n
-n "$NODE_VERSION"
-
-# Ensure n-managed binaries take precedence over the apt-installed ones
-export PATH="/usr/local/bin:$PATH"
-hash -r 2>/dev/null || true
-
-npm install -g yarn
-npm install -g prisma
-info "Node.js $(node -v) / npm $(npm -v) installed via n (requested: $NODE_VERSION)."
+# Runtimes are installed system-wide (not under /root) so app users can execute them
+for RUNTIME in "${RUNTIMES[@]}"; do
+    case "$RUNTIME" in
+        node)
+            info "Installing Node.js (via n) — version: $NODE_VERSION ..."
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+            apt install nodejs -y
+            npm install -g n
+            n "$NODE_VERSION"
+            export PATH="/usr/local/bin:$PATH"
+            hash -r 2>/dev/null || true
+            npm install -g yarn
+            npm install -g prisma
+            info "Node.js $(node -v) / npm $(npm -v) installed."
+            ;;
+        deno)
+            info "Installing Deno ..."
+            DENO_INSTALL="/opt/deno"
+            curl -fsSL https://deno.land/install.sh | DENO_INSTALL="$DENO_INSTALL" sh -s -- --yes
+            ln -sf "${DENO_INSTALL}/bin/deno" /usr/local/bin/deno
+            info "Deno $(deno --version | head -1) installed."
+            ;;
+        bun)
+            info "Installing Bun ..."
+            BUN_INSTALL="/opt/bun"
+            curl -fsSL https://bun.sh/install | BUN_INSTALL="$BUN_INSTALL" bash
+            ln -sf "${BUN_INSTALL}/bin/bun" /usr/local/bin/bun
+            info "Bun $(bun --version) installed."
+            ;;
+        *)
+            warn "Unknown runtime '$RUNTIME' — skipping."
+            ;;
+    esac
+done
 
 # ============================================================
-# 10. Process Management — PM2
+# 7. Process Management — PM2
 # ============================================================
 
-section "10. PM2 Installation"
+section "7. PM2 Installation"
 
+# Each app user runs its own PM2 daemon; add-app sets that up per app.
 npm install -g pm2
-PM2_STARTUP_OUTPUT=$(su - "$DEPLOY_USER" -c "pm2 startup systemd -u $DEPLOY_USER --hp /home/$DEPLOY_USER" 2>&1 || true)
-PM2_STARTUP=$(echo "$PM2_STARTUP_OUTPUT" | grep "sudo env" || true)
-if [[ -n "$PM2_STARTUP" ]]; then
-    eval "$PM2_STARTUP"
-    info "PM2 startup configured."
+info "PM2 installed."
+
+# ============================================================
+# 8. Install add-app and remove-app
+# ============================================================
+
+section "8. Installing add-app and remove-app"
+
+mkdir -p "$SHARE_DIR"
+fetch_file "add-app.sh" "$ADD_APP_BIN"
+fetch_file "remove-app.sh" "$REMOVE_APP_BIN"
+chmod 755 "$ADD_APP_BIN" "$REMOVE_APP_BIN"
+fetch_file "placeholder.js" "${SHARE_DIR}/placeholder.js"
+chmod 644 "${SHARE_DIR}/placeholder.js"
+
+# Server-wide settings that add-app reads
+{
+    echo "# Written by setup.sh — read by add-app"
+    printf 'DEPLOY_USER=%q\n' "$DEPLOY_USER"
+    printf 'SSL_EMAIL=%q\n' "$SSL_EMAIL"
+} > "$CONFIG_FILE"
+chmod 644 "$CONFIG_FILE"
+
+info "Installed $ADD_APP_BIN and $REMOVE_APP_BIN (settings in $CONFIG_FILE)."
+
+# ============================================================
+# Done — optionally add the first app
+# ============================================================
+
+section "Server Setup Complete"
+
+echo ""
+read -rp "Add the first app now? [Y/n]: " ADD_FIRST_APP
+if [[ "${ADD_FIRST_APP,,}" != "n" ]]; then
+    "$ADD_APP_BIN"
 else
-    warn "Could not automatically configure PM2 startup. Run 'pm2 startup' manually as $DEPLOY_USER."
+    info "Add an app any time (as ${ADMIN_USER}): sudo add-app"
 fi
 
-su - "$DEPLOY_USER" -c "
-    pm2 install pm2-logrotate
-    pm2 set pm2-logrotate:max_size 10M
-    pm2 set pm2-logrotate:retain 7
-    pm2 set pm2-logrotate:compress true
-    pm2 set pm2-logrotate:dateFormat YYYY-MM-DD_HH-mm-ss
-    pm2 set pm2-logrotate:rotateInterval '0 0 * * *'
-"
-info "PM2 log rotation configured (10M max, 7 days, daily at midnight, gzip compressed)."
-
-# ============================================================
-# 11. Application Directory
-# ============================================================
-
-section "11. Application Setup"
-
-mkdir -p "$APP_DIR"
-chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "$APP_DIR"
-info "Created application directory: $APP_DIR"
-
-# ============================================================
-# 11b. Hello World Placeholder App
-# ============================================================
-
-section "11b. Hello World Placeholder"
-
-PLACEHOLDER_URL="https://raw.githubusercontent.com/luixfr/Setup-Node-Server/main/placeholder.js"
-info "Downloading placeholder from $PLACEHOLDER_URL ..."
-curl -fsSL "$PLACEHOLDER_URL" -o "${APP_DIR}/server.js" || error "Failed to download placeholder.js"
-chown "${DEPLOY_USER}:${DEPLOY_USER}" "${APP_DIR}/server.js"
-info "Placeholder downloaded to ${APP_DIR}/server.js"
-
-# ============================================================
-# 12. PM2 Ecosystem Config
-# ============================================================
-
-section "12. PM2 Ecosystem Config"
-
-ECOSYSTEM_FILE="/home/${DEPLOY_USER}/ecosystem.config.js"
-cat > "$ECOSYSTEM_FILE" <<EOF
-module.exports = {
-  apps: [
-    {
-      // Placeholder: update script/interpreter for your app after deploying:
-      //
-      // Next.js:
-      //   script: "npx", args: "next start"
-      //
-      // TypeScript (tsx):
-      //   script: "index.ts", interpreter: "./node_modules/.bin/tsx"
-      //   (or interpreter: "tsx" if tsx is installed globally)
-      name: "${APP_NAME}",
-      script: "node",
-      args: "server.js",
-      cwd: "${APP_DIR}/",
-      log_date_format: "YYYY-MM-DD HH:mm Z",
-      env: {
-        NODE_ENV: "production",
-        PORT: ${APP_PORT},
-        DOMAIN: "${DOMAIN}",
-      },
-    },
-  ],
-}
-EOF
-chown "${DEPLOY_USER}:${DEPLOY_USER}" "$ECOSYSTEM_FILE"
-info "PM2 ecosystem config written to $ECOSYSTEM_FILE"
-
-# ============================================================
-# 13. NGINX Site Configuration
-# ============================================================
-
-section "13. NGINX Site Configuration"
-
-NGINX_CONF="/etc/nginx/sites-available/${DOMAIN}"
-# Only the HTTP block — certbot will add the redirect and the 443 SSL block
-cat > "$NGINX_CONF" <<EOF
-server {
-    listen 80;
-    server_name ${DOMAIN};
-    client_max_body_size 30M;
-
-    location / {
-        proxy_pass http://localhost:${APP_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_cache_bypass \$http_upgrade;
-    }
-}
-EOF
-
-ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/
-
-nginx -t || error "NGINX configuration test failed. Check $NGINX_CONF"
-systemctl restart nginx
-info "NGINX site configured and reloaded."
-
-# ============================================================
-# 14. SSL Certificate
-# ============================================================
-
-section "14. SSL Certificate"
-
-info "Requesting SSL certificate from Let's Encrypt for $DOMAIN ..."
-certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "admin@${DOMAIN#*.}" --redirect || {
-    warn "Certbot failed. This usually means DNS has not propagated yet."
-    warn "Once DNS is ready, run: sudo certbot --nginx -d $DOMAIN"
-}
-
-# ============================================================
-# Start placeholder app
-# ============================================================
-
-section "Starting Placeholder App"
-
-su - "$DEPLOY_USER" -c "pm2 start /home/${DEPLOY_USER}/ecosystem.config.js"
-su - "$DEPLOY_USER" -c "pm2 save"
-info "Placeholder app started via PM2."
-
-# ============================================================
-# Done
-# ============================================================
-
-section "Setup Complete"
-
 echo ""
-info "Next steps:"
-echo "  1. Visit http://${DOMAIN} to confirm the placeholder page loads."
-echo ""
-echo "  2. Verify SSH login from your local machine:"
-echo "       ssh ${DEPLOY_USER}@${DOMAIN}"
-echo ""
-echo "  3. When ready to deploy your app:"
-echo "       a. Push your build to ${DEPLOY_USER}@${DOMAIN}:${APP_DIR}"
-echo "       b. Update ~/ecosystem.config.js (switch script to the command to start your application, e.g. 'npx next start')"
-echo "       c. Run: pm2 restart ${APP_NAME} && pm2 save"
-echo ""
-echo "  4. Add your .env variables on the server:"
-echo "       nano ${APP_DIR}/.env"
-echo ""
-echo "  5. Test certificate auto-renewal:"
-echo "       sudo certbot renew --dry-run"
-echo ""
-info "Placeholder is live at http://${DOMAIN}"
-info "Once certbot succeeded, it will also be at https://${DOMAIN}"
+if [[ "$SSH_HARDENED" == true ]]; then
+    warn "Root SSH login is now DISABLED. Before closing this session, verify in a new terminal:"
+    echo "       ssh ${ADMIN_USER}@<server>   (then: sudo -n true)"
+    echo ""
+fi
+info "Logins:"
+echo "  ssh ${ADMIN_USER}@<server>    # server maintenance (sudo), add apps: sudo add-app"
+echo "  ssh ${DEPLOY_USER}@<server>   # deployments"
